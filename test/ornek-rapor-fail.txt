@@ -1,0 +1,65 @@
+mats version 455.107.  Testing GA104 with 5 MB of memory starting with 0 MB.
+Memory Errors on
+Read    Error Count: 0
+Write   Error Count: 1
+Unknown Error Count: 0
+
+=== MEMORY ERRORS BY SUBPARTITION ===
+SUBPART READ ERRORS WRITE ERRORS UNKNOWN ERRS
+------- ----------- ------------ ------------
+FBIOA0            0            0            0
+FBIOA1            0            0            0
+FBIOB0            0            1            0
+FBIOB1            0            0            0
+FBIOC0            0            0            0
+FBIOC1            0            0            0
+FBIOD0            0            0            0
+FBIOD1            0            0            0
+
+Failing Bits:
+B015
+
+
+Memory Errors on
+Read    Error Count: 0
+Write   Error Count: 1
+Unknown Error Count: 0
+
+=== MEMORY ERRORS BY SUBPARTITION ===
+SUBPART READ ERRORS WRITE ERRORS UNKNOWN ERRS
+------- ----------- ------------ ------------
+FBIOA0            0            0            0
+FBIOA1            0            0            0
+FBIOB0            0            1            0
+FBIOB1            0            0            0
+FBIOC0            0            0            0
+FBIOC1            0            0            0
+FBIOD0            0            0            0
+FBIOD1            0            0            0
+
+Failing Bits:
+B015
+
+
+
+=== MEMORY ERRORS BY BIT ===
+P : Partition (FBIO)
+                                            READ 0 READ 1 READ ?
+P BIT READ ERRORS WRITE ERRORS UNKNOWN ERRS EXP. 1 EXP. 0 EXP. ?
+- --- ----------- ------------ ------------ ------ ------ ------
+B 015           0            1            0      0      1      0
+
+
+=== MEMORY ERRORS BY ADDRESS ===
+ADDRESS : Failing memory address, or buffer offset if starting with 'X+'
+T : Type of memory error: W = write, R = read
+P : Partition (FBIO)
+S : Subpartition
+B : Bank
+E : Beat
+U : PseudoChannel
+   ADDRESS EXPECTED   ACTUAL  REREAD1  REREAD2 FAILBITS TPSBEU  ROW COL BIT(s)
+   ------- --------   ------  -------  ------- -------- ------  --- --- ------
+000048ec60 55555555 5555d555 5555d555 5555d555 00008000 WB0700 0009 013   B015
+If you are getting failure for first MB of FB then try option -no_scan_out
+Error Code = 00000001

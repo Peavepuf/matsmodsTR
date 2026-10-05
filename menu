@@ -1,0 +1,634 @@
+#!/bin/bash
+# matsmodstr: NVIDIA MATS/MODS icin Turkce test menusu. Kullanim: ./menu
+# Not: Yazilar bilerek ASCII (Turkce karakter yok); konsolda goruntu sorunu olmasin diye.
+
+hwclock -s 2>/dev/null
+KOK=${MATSMODS_HOME:-/home}   # ana klasor (testler icin degistirilebilir; normalde /home)
+KONF="$KOK/menu.conf"         # secimlerin saklandigi ayar dosyasi (silersen ilk acilis gibi olur)
+REPDIR="$KOK/reports"
+DIR=""        # MATS/MODS surum klasoru (/home altinda, icinde mats dosyasi olan klasor)
+NARGS=""      # MATS'a verilecek GPU secimi (-n X) ya da bos (ana GPU)
+ADI=""        # bulunan GPU/cip adi (ornek: GA104)
+GPU_KAYIT=0   # 1 ise GPU secimi ayar dosyasindan okundu
+GPU_SECIM=""
+GPU_ADI=""
+
+bekle() { echo; read -p "Devam icin Enter'a bas..." _; }
+
+# --- Ayar dosyasi ve surum klasoru secimi ---
+konf_oku() { [ -f "$KONF" ] && . "$KONF"; }
+konf_yaz() {
+    printf 'SURUM="%s"
+GPU_KAYIT="%s"
+GPU_SECIM="%s"
+GPU_ADI="%s"
+' "$DIR" "$GPU_KAYIT" "$GPU_SECIM" "$GPU_ADI" > "$KONF"
+    sync
+}
+
+# /home altinda icinde mats dosyasi olan klasorleri bul (SURUMLER dizisi)
+surumleri_bul() {
+    SURUMLER=()
+    for d in "$KOK"/*/; do
+        d=${d%/}
+        [ -f "$d/mats" ] && SURUMLER+=("$d")
+    done
+}
+
+# Kullaniciya surum klasoru sectir ve kaydet
+surum_sec() {
+    surumleri_bul
+    if [ "${#SURUMLER[@]}" -eq 0 ]; then
+        echo "HATA: $KOK altinda icinde 'mats' dosyasi olan klasor yok."
+        echo "Imajin dogru yazildigini ve menu dosyasinin dogru bolumun home klasorunde oldugunu kontrol et."
+        return 1
+    fi
+    echo "Kartina uygun MATS/MODS surum klasorunu sec."
+    echo "(Klasor adinda kart modeli varsa onu sec; yoksa genel surumlerden biriyle kucuk bir testle dene.)"
+    i=1
+    for x in "${SURUMLER[@]}"; do
+        mark=""; [ "$x" = "$DIR" ] && mark="   <- su an secili"
+        echo " $i) $(basename "$x")$mark"
+        i=$((i + 1))
+    done
+    read -p "Numara: " n
+    if ! sayi_mi "$n" || [ "$n" -gt "${#SURUMLER[@]}" ]; then echo "Gecersiz secim."; return 1; fi
+    DIR="${SURUMLER[$((n - 1))]}"
+    konf_yaz
+    echo "Secildi: $(basename "$DIR") (ayar dosyasina kaydedildi)"
+    return 0
+}
+
+# Acilista surum klasorunu belirle: ayar dosyasi, tek klasor varsa o, yoksa sor
+surum_belirle() {
+    konf_oku
+    [ -n "$SURUM" ] && [ -f "$SURUM/mats" ] && { DIR="$SURUM"; return 0; }
+    surumleri_bul
+    if [ "${#SURUMLER[@]}" -eq 1 ]; then DIR="${SURUMLER[0]}"; konf_yaz; return 0; fi
+    surum_sec
+}
+
+# Pozitif tam sayi mi?
+sayi_mi() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
+
+# MB miktarini sor (bos=100, 5-100 arasi)
+sor_mb() {
+    read -p "Kac MB test edilsin? (5-100, bos=100): " MB
+    [ -z "$MB" ] && MB=100
+    if ! sayi_mi "$MB" || [ "$MB" -lt 5 ] || [ "$MB" -gt 100 ]; then echo "MB 5 ile 100 arasinda olmali, 100 kullaniliyor."; MB=100; fi
+}
+
+# MATS programi var mi?
+mats_var_mi() {
+    if [ ! -f "$DIR/mats" ]; then
+        echo "HATA: $DIR/mats bulunamadi. Surum klasorunu menu v ile sec ya da imajin dogru yazildigini kontrol et."
+        return 1
+    fi
+    return 0
+}
+
+# Tek bir MATS turu sonucu: raporu okuyup SON, TOP, BOL, BIT degiskenlerini doldurur
+oku_rapor() {
+    f="$1"; SON="RAPOR_YOK"; TOP=0; BOL="-"; BIT="-"
+    [ -f "$f" ] || return
+    R=$(grep -m1 "Read    Error Count" "$f" | awk '{print $NF}')
+    W=$(grep -m1 "Write   Error Count" "$f" | awk '{print $NF}')
+    U=$(grep -m1 "Unknown Error Count" "$f" | awk '{print $NF}')
+    if [ -z "$R$W$U" ]; then SON="TANINMADI"; return; fi
+    TOP=$((R + W + U))
+    if [ "$TOP" -eq 0 ]; then SON="PASS"; return; fi
+    SON="FAIL"
+    BOL=$(awk '/=== MEMORY ERRORS BY SUBPARTITION/ {n++} n==1 && /^FBIO/ && ($2+$3+$4)>0 {printf "%s,",$1}' "$f" | sed 's/,$//')
+    BIT=$(awk '/^Failing Bits:/ {getline; print; exit}' "$f" | tr -s ' ,' ',' | sed 's/^,//; s/,$//')
+    [ -z "$BOL" ] && BOL="?"
+    [ -z "$BIT" ] && BIT="?"
+}
+
+# Calisma kaydi ("canli" satirlari): kilitlenirse son satir son calisma ani
+nabiz_baslat() {
+    ( while true; do echo "$(date +%T) canli" >> "$1"; sync; sleep 5; done ) &
+    HB=$!
+}
+nabiz_durdur() { kill "$HB" 2>/dev/null; wait "$HB" 2>/dev/null; }
+
+# Tek bir MATS turu calistir (imlec gizli: yanip sonen imlec sahte hata uretebilir)
+kos() {
+    cd "$DIR" || return
+    rm -f report.txt
+    tput civis
+    ./mats $2 -e "$1"
+    tput cnorm
+    sync
+    oku_rapor report.txt
+}
+
+# GPU secimini sor (kayitli secim varsa bos=kayitli)
+sor_gpu() {
+    if [ "$GPU_KAYIT" = "1" ]; then
+        read -p "GPU: bos=kayitli (${GPU_ADI:-?}, ${GPU_SECIM:-ana GPU}), a=yeniden bul, x=ana GPU, sayi=-n: " GN
+        if [ -z "$GN" ]; then NARGS="$GPU_SECIM"; ADI="$GPU_ADI"; return 0; fi
+    else
+        read -p "GPU: bos=otomatik bul, x=ana GPU, sayi=-n sayisi: " GN
+    fi
+    case "$GN" in
+        ''|a|A) gpu_bul || return 1 ;;
+        x|X) NARGS=""; ADI="?"; gpu_kaydet ;;
+        *[!0-9]*) echo "Gecersiz, otomatik bulunuyor."; gpu_bul || return 1 ;;
+        *) NARGS="-n $GN"; ADI="?"; gpu_kaydet ;;
+    esac
+    return 0
+}
+
+# GPU secimini ayar dosyasina kaydet
+gpu_kaydet() { GPU_KAYIT=1; GPU_SECIM="$NARGS"; GPU_ADI="$ADI"; konf_yaz; }
+
+# Otomatik GPU bul: -n 1, -n 0, -n yok sirasiyla kucuk bir test dene
+gpu_bul() {
+    mats_var_mi || return 1
+    cd "$DIR" || return 1
+    echo "GPU araniyor (en fazla 3 kisa deneme)..."
+    for cand in "-n 1" "-n 0" ""; do
+        rm -f report.txt
+        tput civis
+        ./mats $cand -e 5 >/dev/null 2>&1
+        tput cnorm
+        if [ -f report.txt ] && head -n 1 report.txt | grep -q "Testing"; then
+            NARGS="$cand"
+            ADI=$(head -n 1 report.txt | sed -n 's/.*Testing \([^ ]*\) with.*/\1/p')
+            echo "Bulundu: ${ADI:-?}  (secim: ${cand:-ana GPU}) - ayar dosyasina kaydedildi."
+            gpu_kaydet
+            return 0
+        fi
+    done
+    echo "GPU bulunamadi."
+    echo "Kart ikinci GPU ise once menuden 2'yi (modsinit) calistirip tekrar dene."
+    return 1
+}
+
+# Raporu ekranda kaydirarak goster (ok tuslari, q ile cik)
+tam() {
+    [ -f "$1" ] || { echo "Rapor yok: $1"; return; }
+    if command -v less >/dev/null 2>&1; then less "$1"; else nano -v "$1"; fi
+}
+
+# Tek raporu okunur sekilde ozetle
+ozet() {
+    f="$1"
+    [ -f "$f" ] || { echo "Rapor yok: $f"; return; }
+    echo "=================== RAPOR OZETI ==================="
+    echo "Dosya : $f"
+    head -n 1 "$f"
+    R=$(grep -m1 "Read    Error Count" "$f" | awk '{print $NF}')
+    W=$(grep -m1 "Write   Error Count" "$f" | awk '{print $NF}')
+    U=$(grep -m1 "Unknown Error Count" "$f" | awk '{print $NF}')
+    if [ -z "$R$W$U" ]; then
+        echo "Rapor bicimi taninmadi. Tam raporu goster (menu 8)."
+        return
+    fi
+    TOP=$((R + W + U))
+    echo "---------------------------------------------------"
+    if [ "$TOP" -eq 0 ]; then
+        echo "SONUC : PASS - hata yok"
+    else
+        echo "SONUC : FAIL - toplam $TOP hata"
+    fi
+    echo "  Okuma hatasi (read)    : $R"
+    echo "  Yazma hatasi (write)   : $W"
+    echo "  Bilinmeyen hata        : $U"
+    if [ "$TOP" -gt 0 ]; then
+        echo "---------------------------------------------------"
+        echo "HATALI BELLEK BOLGELERI (sadece hatasi olanlar):"
+        awk '/=== MEMORY ERRORS BY SUBPARTITION/ {n++} n==1 && /^FBIO/ && ($2+$3+$4)>0 {printf "  %-7s okuma:%s  yazma:%s  bilinmeyen:%s\n",$1,$2,$3,$4}' "$f"
+        echo "HATALI BITLER (harf=bellek bolumu, sayi=bit no):"
+        awk '/^Failing Bits:/ {getline; print "  " $0; exit}' "$f"
+        echo "HATALI ADRESLER:"
+        echo "  ADRES      BEKLENEN GERCEK   FAILBITS TPSBEU  BIT"
+        grep -E '^ *[0-9a-fA-F]{10} ' "$f" | awk '{printf "  %s %s %s %s %s %s\n",$1,$2,$3,$6,$7,$NF}' | head -n 20
+        echo "---------------------------------------------------"
+        grep -m1 "Error Code" "$f"
+        echo "NOT: Tek bir hata kesin ariza degildir. Testi birkac kez"
+        echo "tekrarla (menu 5 ya da 3). Ayni bolge/bit hep cikiyorsa gercek hatadir."
+    fi
+    echo "==================================================="
+}
+
+# MODS logunu ozetle: sonuc (Error Code), hata satirlari, son satirlar
+mods_ozet() {
+    f="$1"
+    [ -f "$f" ] || { echo "mods.log yok: $f"; return; }
+    echo "=================== MODS OZETI ==================="
+    echo "Dosya : $f"
+    grep -m1 "MODS start" "$f"
+    EC=$(grep "Error Code" "$f" | tail -n 1)
+    echo "---------------------------------------------------"
+    if [ -z "$EC" ]; then
+        echo "SONUC : BELIRSIZ - log'da 'Error Code' satiri yok"
+        echo "        (test yarida kesilmis ya da bitmemis olabilir)"
+    elif echo "$EC" | grep -q "(ok)"; then
+        echo "SONUC : PASS"
+    else
+        echo "SONUC : FAIL"
+    fi
+    [ -n "$EC" ] && echo "$EC"
+    grep "MODS end" "$f" | tail -n 1
+    echo "---------------------------------------------------"
+    echo "HATA/FAIL SATIRLARI (ilk 20):"
+    grep -i -E "fail|error|mismatch|timeout" "$f" | grep -v "(ok)" | head -n 20
+    echo "---------------------------------------------------"
+    echo "SON 12 SATIR:"
+    tail -n 12 "$f"
+    echo "==================================================="
+}
+
+# Tek test (MATS ya da MODS) calistir, ozeti goster, tarihli kopya al
+calistir() {
+    cd "$DIR" || { echo "Klasor yok: $DIR"; return; }
+    rm -f report.txt mods.log
+    ISMATS=0
+    if [ "$1" = "./mats" ] && [ -n "$MB" ]; then
+        ISMATS=1
+        rate=$(cat "$KOK/mats_rate" 2>/dev/null)
+        case "$rate" in ''|*[!0-9]*) rate=900 ;; esac
+        est=$((MB * rate / 1000))
+        echo "Test basliyor: $MB MB. Tahmini sure: yaklasik $((est / 60)) dk $((est % 60)) sn."
+        echo "Test sirasinda ekrana bir sey yazilmaz, bu normaldir. Bekle."
+        sleep 3
+    fi
+    t0=$(date +%s)
+    mkdir -p "$REPDIR"
+    LOG="$REPDIR/calisma-$(date +%m%d-%H%M%S).log"
+    echo "komut: $* | MB: ${MB:-yok} | baslangic: $(date)" > "$LOG"
+    nabiz_baslat "$LOG"
+    trap ':' INT        # Ctrl+C testi durdurur ama menuyu kapatmaz
+    tput civis
+    "$@"
+    RC=$?
+    tput cnorm
+    nabiz_durdur
+    trap - INT
+    echo "bitis: $(date) | cikis kodu: $RC" >> "$LOG"
+    el=$(( $(date +%s) - t0 ))
+    sync
+    clear
+    echo "Gecen sure: $((el / 60)) dk $((el % 60)) sn"
+    if [ "$ISMATS" -eq 1 ] && [ "$MB" -ge 50 ] && [ "$el" -gt 0 ]; then
+        echo $((el * 1000 / MB)) > "$KOK/mats_rate"
+    fi
+    if [ "$ISMATS" -eq 1 ]; then
+        ozet "$DIR/report.txt"
+        if [ -f "$DIR/report.txt" ]; then
+            cp "$DIR/report.txt" "$REPDIR/mats-$(date +%m%d-%H%M%S).txt"
+            echo "Kopya $REPDIR/ klasorune kaydedildi (menu 9)."
+        fi
+    else
+        mods_ozet "$DIR/mods.log"
+        if [ -f "$DIR/mods.log" ]; then
+            cp "$DIR/mods.log" "$REPDIR/mods-$(date +%m%d-%H%M%S).txt"
+            echo "Kopya $REPDIR/ klasorune kaydedildi (menu 9)."
+        fi
+    fi
+}
+
+# Tekrarli test: N kez art arda MATS, hangi turlar hatali
+tekrar() {
+    mats_var_mi || return
+    sor_mb
+    read -p "Kac kez tekrarlansin? (bos=3): " N
+    [ -z "$N" ] && N=3
+    if ! sayi_mi "$N"; then echo "Gecersiz sayi, 3 kullaniliyor."; N=3; fi
+    sor_gpu || return
+
+    rate=$(cat "$KOK/mats_rate" 2>/dev/null)
+    case "$rate" in ''|*[!0-9]*) rate=900 ;; esac
+    est=$((N * (MB * rate / 1000 + 3)))
+    echo "Toplam $N tur x $MB MB. Tahmini sure: yaklasik $((est / 60)) dk."
+    echo "Durdurmak icin Ctrl+C (o anki tur biter, o ana kadarki ozet gosterilir)."
+    sleep 3
+
+    mkdir -p "$REPDIR"
+    ST=$(date +%m%d-%H%M%S)
+    OZ="$REPDIR/tekrar-$ST-ozet.txt"
+    : > "$OZ"
+    LOG="$REPDIR/calisma-tekrar-$ST.log"
+    echo "tekrarli test: $N x $MB MB $NARGS | baslangic: $(date)" > "$LOG"
+    nabiz_baslat "$LOG"
+    STOP=0
+    trap 'STOP=1' INT
+    i=1
+    while [ "$i" -le "$N" ]; do
+        kos "$MB" "$NARGS"
+        # Sadece PASS olmayan turlarin raporu ayri kaydedilir (tum sonuclar ozet dosyasinda)
+        [ -f "$DIR/report.txt" ] && [ "$SON" != "PASS" ] && cp "$DIR/report.txt" "$REPDIR/tekrar-$ST-$i.txt"
+        echo "$i|$MB|$SON|$TOP|$BOL|$BIT" >> "$OZ"
+        echo "tur $i: $SON (hata: $TOP)" >> "$LOG"; sync
+        if [ "$N" -le 30 ] || [ "$SON" != "PASS" ]; then
+            echo "[$i/$N] $SON  hata:$TOP  bolge:$BOL  bit:$BIT"
+        fi
+        [ "$STOP" -eq 1 ] && { echo "Ctrl+C: seri durduruldu."; break; }
+        i=$((i + 1))
+    done
+    nabiz_durdur
+    trap - INT
+    echo "bitis: $(date)" >> "$LOG"
+
+    clear
+    echo "============== TEKRARLI TEST OZETI =============="
+    echo "Her tur $MB MB, secim: ${NARGS:-ana GPU}"
+    echo "-------------------------------------------------"
+    echo "TUR  SONUC      HATA  BOLGE          BIT"
+    if [ "$(wc -l < "$OZ")" -le 30 ]; then
+        awk -F'|' '{printf "%-4s %-10s %-5s %-14s %s\n",$1,$3,$4,$5,$6}' "$OZ"
+    else
+        echo "(30 turdan fazla: sadece PASS olmayan turlar gosteriliyor)"
+        awk -F'|' '$3!="PASS" {printf "%-4s %-10s %-5s %-14s %s\n",$1,$3,$4,$5,$6}' "$OZ"
+    fi
+    echo "-------------------------------------------------"
+    TOPLAM=$(wc -l < "$OZ")
+    FAILN=$(awk -F'|' '$3=="FAIL"' "$OZ" | wc -l)
+    YOKN=$(awk -F'|' '$3=="RAPOR_YOK"' "$OZ" | wc -l)
+    echo "Yapilan tur: $TOPLAM   FAIL: $FAILN   Rapor yok: $YOKN"
+    if [ "$FAILN" -gt 0 ]; then
+        echo "HATALI TURLAR: $(awk -F'|' '$3=="FAIL" {printf "%s ",$1}' "$OZ" | cut -c1-200)"
+        echo "Hangi bolge kac turda hata verdi:"
+        awk -F'|' '$3=="FAIL" {n=split($5,a,","); for(k=1;k<=n;k++) c[a[k]]++} END{for(k in c) printf "  %s : %d tur\n", k, c[k]}' "$OZ"
+        echo "Hangi bit kac turda hata verdi:"
+        awk -F'|' '$3=="FAIL" {n=split($6,a,","); for(k=1;k<=n;k++) c[a[k]]++} END{for(k in c) printf "  %s : %d tur\n", k, c[k]}' "$OZ"
+        echo "Ayni bolge/bit cogu turda tekrar ediyorsa tutarli bir hatadir."
+    elif [ "$YOKN" -gt 0 ]; then
+        echo "Bazi turlarda rapor olusmadi (test yarida kesilmis ya da hata)."
+    else
+        echo "Tum turlar PASS."
+    fi
+    echo "Ozet dosyasi: $OZ  (menu 9)"
+    echo "================================================="
+}
+
+# ---- Karne: otomatik tani sonucunu yorumla ----
+# Girdi: ozet dosyasi (satir: tur|boyut|sonuc|hata|bolge|bit)
+karne_yaz() {
+    OZ="$1"; ILK="$2"; SURE="$3"
+    T=$(wc -l < "$OZ")
+    F=$(awk -F'|' '$3=="FAIL"' "$OZ" | wc -l)
+    Y=$(awk -F'|' '$3=="RAPOR_YOK"' "$OZ" | wc -l)
+    MAXMB=$(awk -F'|' '{if($2+0>m) m=$2+0} END{print m+0}' "$OZ")
+    PM=$(awk -F'|' '$3=="FAIL"{n=split($5,a,","); for(k=1;k<=n;k++) c[a[k]]++} END{m=0; for(k in c) if(c[k]>m){m=c[k];p=k}; print m+0, p}' "$OZ")
+    PMAX=${PM%% *}; PADI=${PM#* }
+    BITLER=$(awk -F'|' '$3=="FAIL"{n=split($6,a,","); for(k=1;k<=n;k++) if(a[k]!="" && a[k]!="?") s[a[k]]=1} END{for(k in s) print k}' "$OZ" | sort | tr '\n' ' ')
+    NBIT=$(echo "$BITLER" | wc -w)
+
+    echo "=================== GPU KARNESI ==================="
+    echo "Tarih          : $(date)"
+    echo "Cip / GPU      : ${ADI:-?}"
+    [ -f "$ILK" ] && head -n 1 "$ILK" | sed -n 's/^\(mats version [0-9.]*\).*/Program        : \1/p'
+    [ -f "$ILK" ] && echo "Bellek alt bolum sayisi: $(awk '/=== MEMORY ERRORS BY SUBPARTITION/ {n++} n==1 && /^FBIO/ {c++} END{print c+0}' "$ILK")"
+    if command -v lspci >/dev/null 2>&1; then
+        PCI=$(lspci -nn 2>/dev/null | grep -i nvidia | head -n 1)
+        if [ -n "$PCI" ]; then
+            echo "PCI            : $PCI"
+            ADR=${PCI%% *}
+            lspci -vv -s "$ADR" 2>/dev/null | grep -E "LnkCap:|LnkSta:" | sed 's/^[ \t]*/                 /'
+        fi
+    else
+        echo "PCI            : (bu imajda lspci yok)"
+    fi
+    echo "Test suresi    : $((SURE / 60)) dk $((SURE % 60)) sn"
+    echo "Yapilan tur    : $T   (en buyuk test: $MAXMB MB)"
+    echo "---------------------------------------------------"
+    echo "BOYUT  TUR  FAIL  RAPOR_YOK"
+    awk -F'|' '{n[$2]++; if($3=="FAIL") f[$2]++; if($3=="RAPOR_YOK") y[$2]++} END{for(k in n) printf "%s|%d|%d|%d\n",k,n[k],f[k]+0,y[k]+0}' "$OZ" | sort -n | awk -F'|' '{printf "%-6s %-4s %-5s %s\n",$1" MB",$2,$3,$4}'
+    echo "---------------------------------------------------"
+    if [ "$F" -eq 0 ] && [ "$Y" -eq 0 ]; then
+        KARAR="SAGLAM GORUNUYOR (bu testlerde hata yok)"
+    elif [ "$F" -eq 0 ]; then
+        KARAR="BELIRSIZ (testler yarim kaldi ya da rapor olusmadi)"
+    elif [ "$F" -eq 1 ]; then
+        KARAR="SUPHELI (tek seferlik hata, tekrar eden hata yok)"
+    elif [ "$PMAX" -ge 2 ] && [ $((PMAX * 2)) -ge "$F" ]; then
+        KARAR="ARIZALI SUPHESI YUKSEK (ayni bolgede tutarli hata)"
+    else
+        KARAR="ARIZALI SUPHESI (hatalar farkli bolgelerde, kararsiz)"
+    fi
+    echo "KARAR: $KARAR"
+    echo "Hatali tur: $F / $T   Rapor olusmayan tur: $Y"
+    if [ "$F" -gt 0 ]; then
+        echo "En sik hata veren bolge: $PADI ($PMAX tur)"
+        echo "Hatali bitler ($NBIT adet): $BITLER"
+    fi
+    echo "---------------------------------------------------"
+    echo "ONERI:"
+    if [ "$F" -eq 0 ] && [ "$Y" -eq 0 ]; then
+        echo " - Bu testlerde bellek hatasi gorulmedi."
+        echo " - Ama yalnizca bellegin kucuk bir kismi ($MAXMB MB) denendi."
+        echo " - Sorun yuk altinda cikiyorsa daha uzun testler (profil 3)"
+        echo "   ve Pop!_OS'ta memtest_vulkan (docs/gpu-test.md) dene."
+    elif [ "$F" -eq 0 ]; then
+        echo " - Testi tekrarla. Rapor olusmuyorsa kart/sistem kilitleniyor olabilir."
+        echo " - Menu l ile calisma kaydinda son 'canli' satirina bak."
+    elif [ "$F" -eq 1 ]; then
+        echo " - Testi daha cok tur ile tekrarla (profil 2 ya da 3)."
+        echo " - Hata tekrar etmezse sahte/tek seferlik olabilir; etmezse servis dusun."
+    else
+        echo " - Hata tekrar ediyor: $PADI bolgesi ve yukaridaki bitler."
+        echo " - Isi/guc etkisini ayirmak icin soguk baslangicla ve sogutmayi"
+        echo "   artirarak tekrarla. Hata surerse servise bu karneyi goturebilirsin."
+        echo " - Hangi fiziksel cipe denk geldigini bu program soylemez."
+    fi
+    [ "$Y" -gt 0 ] && echo " - $Y turda rapor olusmadi: kilitlenme ya da yarida kesilme."
+    echo "---------------------------------------------------"
+    echo "NOT: Bu karne yazilimsal bir tahmindir, kesin teshis degildir."
+    echo "==================================================="
+}
+
+# Otomatik tani: profil sec, GPU bul, testleri sirayla kos, karne cikar
+tani() {
+    mats_var_mi || return
+    echo "Otomatik tani profili:"
+    echo " 1) Hizli   (5 MB x5, 20 MB x3, 100 MB x2)"
+    echo " 2) Normal  (5 MB x10, 20 MB x6, 100 MB x4)"
+    echo " 3) Uzun    (5 MB x30, 20 MB x15, 100 MB x10)"
+    echo " 4) Ozel    (kendin yaz, MB 5-100, ornek: 5:10 20:5 100:2)"
+    read -p "Secim (bos=1): " P
+    case "$P" in
+        2) PLAN="5:10 20:6 100:4" ;;
+        3) PLAN="5:30 20:15 100:10" ;;
+        4) read -p "Plan (MB:tekrar MB:tekrar ...): " PLAN
+           ok=1
+           [ -z "$PLAN" ] && ok=0
+           for tok in $PLAN; do
+               a=${tok%%:*}; b=${tok##*:}
+               if ! sayi_mi "$a" || ! sayi_mi "$b" || [ "$a" = "$tok" ] || [ "$a" -lt 5 ] || [ "$a" -gt 100 ]; then ok=0; fi
+           done
+           [ "$ok" -eq 0 ] && { echo "Gecersiz plan (MB 5-100 arasi olmali)."; return; } ;;
+        *) PLAN="5:5 20:3 100:2" ;;
+    esac
+    sor_gpu || return
+
+    TOPLAM=0; MBTOP=0
+    for tok in $PLAN; do
+        a=${tok%%:*}; b=${tok##*:}
+        TOPLAM=$((TOPLAM + b)); MBTOP=$((MBTOP + a * b))
+    done
+    rate=$(cat "$KOK/mats_rate" 2>/dev/null)
+    case "$rate" in ''|*[!0-9]*) rate=900 ;; esac
+    est=$((MBTOP * rate / 1000 + TOPLAM * 3))
+    echo "Toplam $TOPLAM tur, tahmini sure: yaklasik $((est / 60)) dk (tahmindir; buyuk testler daha yavas olabilir)."
+    echo "Durdurmak icin Ctrl+C (o anki tur biter, o ana kadarki sonuclarla karne yazilir)."
+    read -p "Baslasin mi? (E/h): " ONAY
+    case "$ONAY" in h|H) return ;; esac
+
+    mkdir -p "$REPDIR"
+    ST=$(date +%m%d-%H%M%S)
+    OZ="$REPDIR/tani-$ST-ozet.txt"
+    : > "$OZ"
+    LOG="$REPDIR/calisma-tani-$ST.log"
+    echo "otomatik tani: $PLAN $NARGS | baslangic: $(date)" > "$LOG"
+    nabiz_baslat "$LOG"
+    STOP=0
+    trap 'STOP=1' INT
+    t0=$(date +%s)
+    ILK=""
+    i=1
+    for tok in $PLAN; do
+        a=${tok%%:*}; b=${tok##*:}
+        j=1
+        while [ "$j" -le "$b" ]; do
+            kos "$a" "$NARGS"
+            if [ -f "$DIR/report.txt" ]; then
+                # Ilk rapor karne basligi icin saklanir; sadece PASS olmayanlar ayri kaydedilir
+                if [ -z "$ILK" ]; then ILK="$REPDIR/tani-$ST.ilk"; cp "$DIR/report.txt" "$ILK"; fi
+                [ "$SON" != "PASS" ] && cp "$DIR/report.txt" "$REPDIR/tani-$ST-$i.txt"
+            fi
+            echo "$i|$a|$SON|$TOP|$BOL|$BIT" >> "$OZ"
+            echo "tur $i ($a MB): $SON (hata: $TOP)" >> "$LOG"; sync
+            if [ "$TOPLAM" -le 30 ] || [ "$SON" != "PASS" ]; then
+                echo "[$i/$TOPLAM] $a MB: $SON  hata:$TOP  bolge:$BOL  bit:$BIT"
+            fi
+            i=$((i + 1)); j=$((j + 1))
+            [ "$STOP" -eq 1 ] && break
+        done
+        [ "$STOP" -eq 1 ] && { echo "Ctrl+C: tani durduruldu."; break; }
+    done
+    nabiz_durdur
+    trap - INT
+    echo "bitis: $(date)" >> "$LOG"
+    sure=$(( $(date +%s) - t0 ))
+
+    if [ ! -s "$OZ" ]; then echo "Hic tur tamamlanmadi."; return; fi
+    KF="$REPDIR/karne-$ST.txt"
+    karne_yaz "$OZ" "$ILK" "$sure" > "$KF"
+    clear
+    cat "$KF"
+    echo "Karne kaydi: $KF  (menu 9)"
+}
+
+# Kart bilgisi (testsiz, hizli)
+bilgi() {
+    echo "================== KART BILGISI =================="
+    echo "Surum klasoru : $DIR"
+    if command -v lspci >/dev/null 2>&1; then
+        PCI=$(lspci -nn 2>/dev/null | grep -i nvidia)
+        if [ -n "$PCI" ]; then
+            echo "$PCI"
+            ADR=$(echo "$PCI" | head -n 1 | awk '{print $1}')
+            lspci -vv -s "$ADR" 2>/dev/null | grep -E "LnkCap:|LnkSta:"
+            echo "(LnkCap = desteklenen, LnkSta = su anki; ikisi ayni olmali)"
+        else
+            echo "lspci NVIDIA cihazi gostermedi: kart PCIe'de gorunmuyor olabilir."
+        fi
+    else
+        echo "Bu imajda lspci yok. GPU adini otomatik tani (menu 3) karnesinden ogrenebilirsin."
+    fi
+    echo "=================================================="
+}
+
+# Kayitli eski raporlari listele, sec, goster
+raporlar() {
+    files=("$REPDIR"/*.txt)
+    if [ ! -e "${files[0]}" ]; then echo "Kayitli rapor yok."; bekle; return; fi
+    i=1
+    for x in "${files[@]}"; do
+        echo " $i) $(basename "$x")"
+        i=$((i + 1))
+    done
+    read -p "Hangi rapor? (numara, bos=iptal): " n
+    sayi_mi "$n" || return
+    sel="${files[$((n - 1))]}"
+    [ -f "$sel" ] || { echo "Gecersiz."; bekle; return; }
+    b=$(basename "$sel")
+    clear
+    case "$b" in
+        karne-*|*-ozet.txt) cat "$sel"; bekle ;;
+        mods-*) mods_ozet "$sel"; bekle ;;
+        *)
+            echo " 1) Ozet   2) Tamami"
+            read -p "Secim: " m
+            clear
+            if [ "$m" = "2" ]; then tam "$sel"; else ozet "$sel"; bekle; fi ;;
+    esac
+}
+
+# Calisma kayitlarini listele ve goster (son 'canli' = son calisma ani)
+kayitlar() {
+    files=("$REPDIR"/calisma-*.log)
+    if [ ! -e "${files[0]}" ]; then echo "Calisma kaydi yok."; bekle; return; fi
+    i=1
+    for x in "${files[@]}"; do
+        echo " $i) $(basename "$x")"
+        i=$((i + 1))
+    done
+    read -p "Hangi kayit? (numara, bos=iptal): " n
+    sayi_mi "$n" || return
+    sel="${files[$((n - 1))]}"
+    [ -f "$sel" ] || { echo "Gecersiz."; bekle; return; }
+    clear
+    head -n 1 "$sel"
+    echo "..."
+    tail -n 4 "$sel"
+    echo "---------------------------------------------------"
+    echo "Son 'canli' satiri sistemin en son calistigi andir."
+    echo "Altinda 'bitis' satiri yoksa test normal bitmemistir"
+    echo "(kilitlenme, guc kesilmesi ya da yarida kapatma)."
+    bekle
+}
+
+surum_belirle || { echo; echo "Menu surum klasoru olmadan calismaz."; exit 1; }
+
+while true; do
+    clear
+    echo "=============== RTX GPU TEST MENUSU ==============="
+    echo " Surum klasoru: $(basename "$DIR")    Kayitli GPU: ${GPU_ADI:-henuz yok}"
+    echo "---------------------------------------------------"
+    echo " 1) Kart bilgisi (hizli, test yapmaz)"
+    echo " 2) modsinit  (kart ikinci GPU ise ONCE bunu calistir)"
+    echo " 3) OTOMATIK TANI: testleri kosar, KARNE ve karar verir"
+    echo " 4) Tek MATS testi (MB sec)"
+    echo " 5) Tekrarli MATS testi (N kez, hangi tur hatali)"
+    echo " 6) MODS tam GPU testi (denenmedi)"
+    echo " 7) Son test raporu - OZET"
+    echo " 8) Son test raporu - TAMAMI (ok tuslari, q ile cik)"
+    echo " 9) Kayitli raporlar ve karneler"
+    echo " m) Son MODS logu - ozet"
+    echo " l) Calisma kayitlari (kilitlenme ani)"
+    echo " v) Surum klasorunu degistir"
+    echo " k) Kapat (poweroff)"
+    echo " 0) Komut satirina cik"
+    echo "==================================================="
+    read -p "Secim: " c
+    case "$c" in
+        1) bilgi; bekle ;;
+        2) mats_var_mi && cd "$DIR" && { tput civis; ./mods gputest.js -oqa -skip_rm_state_init; tput cnorm; }; bekle ;;
+        3) tani; bekle ;;
+        4) mats_var_mi && { sor_mb; sor_gpu && calistir ./mats $NARGS -e "$MB"; }; bekle ;;
+        5) tekrar; bekle ;;
+        6) mats_var_mi && { MB=""; calistir ./mods gputest.js -oqa -test 118 -run_on_error -fan_speed 60; }; bekle ;;
+        7) clear; ozet "$DIR/report.txt"; bekle ;;
+        8) tam "$DIR/report.txt" ;;
+        9) raporlar ;;
+        m) clear; mods_ozet "$DIR/mods.log"; bekle ;;
+        l) kayitlar ;;
+        v) surum_sec; bekle ;;
+        k) poweroff ;;
+        0) exit 0 ;;
+        *) echo "Gecersiz secim."; sleep 1 ;;
+    esac
+done

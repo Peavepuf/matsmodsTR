@@ -1,0 +1,13 @@
+# NVIDIA MATS/MODS dosyalari ve imajlar telifli, depoya konmaz.
+*.img
+*.iso
+*.7z
+*.zip
+*.exe
+455.*/
+reports/
+mats_rate
+# gpu-test: indirilen araclar ve test kayitlari
+gpu-test/memtest_vulkan/
+gpu-test/FurMark2/
+gpu-test/loglar/

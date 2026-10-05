@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# RTX GPU test menusu (Pop!_OS canli oturumu). Calistirma:
+#   bash /media/pop-os/MODS30xx/GPU-Test/t
+
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK="$HOME/GPU-Test"
+LOGS="$SRC/loglar"
+mkdir -p "$LOGS" 2>/dev/null || LOGS="$HOME/loglar"
+mkdir -p "$LOGS"
+
+# Araclari ev klasorune (RAM) kopyala: USB (FAT32) uzerinde calistirma izni olmayabilir
+if [ ! -x "$WORK/memtest_vulkan/memtest_vulkan" ]; then
+    echo "Araclar hazirlaniyor..."
+    rm -rf "$WORK"
+    mkdir -p "$WORK"
+    cp -r "$SRC/FurMark2" "$SRC/memtest_vulkan" "$WORK/"
+    chmod +x "$WORK/FurMark2/FurMark_linux64/furmark" \
+             "$WORK/FurMark2/FurMark_linux64/FurMark_GUI" \
+             "$WORK/memtest_vulkan/memtest_vulkan"
+fi
+FM="$WORK/FurMark2/FurMark_linux64"
+
+# Hibrit (Intel + NVIDIA) laptopta isi RTX kartina yaptir
+export __NV_PRIME_RENDER_OFFLOAD=1
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+export __VK_LAYER_NV_optimus=NVIDIA_only
+
+stamp() { date +%Y%m%d_%H%M%S; }
+
+# Saniyede bir sicaklik/guc/saat/kullanim kaydi; PID'i yazdirir
+start_monitor() {
+    nvidia-smi --query-gpu=timestamp,temperature.gpu,power.draw,clocks.gr,clocks.mem,utilization.gpu,memory.used,pstate \
+        --format=csv -l 1 > "$1" 2>/dev/null &
+    echo $!
+}
+
+# Kayit dosyasindan en yuksek sicaklik ve gucu ozetle
+ozet() {
+    awk -F', ' 'NR>1 { t=$2+0; p=$3+0; if (t>mt) mt=t; if (p>mp) mp=p; n++ }
+        END { if (n) printf "Ozet: %d olcum, en yuksek sicaklik %d C, en yuksek guc %.1f W\n", n, mt, mp }' "$1"
+    echo "Kayit dosyasi: $1"
+}
+
+kontrol() {
+    if ! nvidia-smi -L >/dev/null 2>&1; then
+        echo "UYARI: nvidia-smi kart bulamadi. Kart su an calismiyor."
+        read -p "Yine de devam? (e/H): " c
+        [ "$c" = "e" ] || return 1
+    fi
+    return 0
+}
+
+while true; do
+    echo
+    echo "================ RTX GPU TEST MENUSU ================"
+    echo " 1) GPU bilgisi (nvidia-smi)"
+    echo " 2) memtest_vulkan - 10 dk (VRAM + GPU yuku)"
+    echo " 3) memtest_vulkan - sinirsiz (Ctrl+C ile bitir)"
+    echo " 4) Canli izleme: sicaklik/guc/saat (Ctrl+C ile cik)"
+    echo " 5) FurMark stres testi 10 dk (MASAUSTU gerekir)"
+    echo " 6) FurMark arayuzu (MASAUSTU gerekir)"
+    echo " 0) Cikis"
+    echo "  Kayitlar: $LOGS"
+    echo "====================================================="
+    read -p "Secim: " c
+    case "$c" in
+        1) nvidia-smi ;;
+        2) kontrol || continue
+           log="$LOGS/memtest_vulkan_$(stamp).csv"; mon=$(start_monitor "$log")
+           echo "Cihaz listesi gelirse NVIDIA kartin olanin numarasini sec."
+           (cd "$WORK/memtest_vulkan" && timeout -s INT 600 ./memtest_vulkan)
+           kill "$mon" 2>/dev/null; ozet "$log" ;;
+        3) kontrol || continue
+           log="$LOGS/memtest_vulkan_$(stamp).csv"; mon=$(start_monitor "$log")
+           echo "Cihaz listesi gelirse NVIDIA kartin olanin numarasini sec."
+           (cd "$WORK/memtest_vulkan" && ./memtest_vulkan)
+           kill "$mon" 2>/dev/null; ozet "$log" ;;
+        4) nvidia-smi -l 1 ;;
+        5) kontrol || continue
+           log="$LOGS/furmark_$(stamp).csv"; mon=$(start_monitor "$log")
+           (cd "$FM" && ./furmark --hpgfx 1 --demo furmark-gl --width 1280 --height 720 --max-time 600)
+           kill "$mon" 2>/dev/null; ozet "$log" ;;
+        6) (cd "$FM" && ./FurMark_GUI) ;;
+        0) exit 0 ;;
+        *) echo "Gecersiz secim." ;;
+    esac
+done

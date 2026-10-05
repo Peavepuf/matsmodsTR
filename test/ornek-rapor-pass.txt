@@ -1,0 +1,4 @@
+mats version 455.107.  Testing GA104 with 5 MB of memory starting with 0 MB.
+Read    Error Count: 0
+Write   Error Count: 0
+Unknown Error Count: 0
